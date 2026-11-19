@@ -13,6 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from model import predict, predict_mlp, make_hourly_weather
+from weather_api import fetch_forecast, MAX_AHEAD_DAYS, MAX_PAST_DAYS
 
 st.set_page_config(page_title="제주 전력수요 예보기", page_icon="⚡", layout="wide")
 HOURS = np.arange(1, 25)
@@ -20,7 +21,14 @@ HOURS = np.arange(1, 25)
 
 @st.cache_resource
 def load_bundle():
-    return joblib.load("model.pkl")
+    # model.pkl이 없거나 scikit-learn 버전이 달라 못 읽으면 그 자리에서 다시 학습
+    try:
+        return joblib.load("model.pkl")
+    except Exception:
+        import train
+        with st.spinner("모형을 학습하는 중입니다 (처음 한 번, 1~2분)..."):
+            train.main()
+        return joblib.load("model.pkl")
 
 
 B = load_bundle()
@@ -29,16 +37,57 @@ Tc, Th = B["Tc"], B["Th"]
 # ------------------------------------------------------------------
 # 사이드바: 입력
 # ------------------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner="Open-Meteo에서 제주 예보를 불러오는 중...")
+def get_forecast(day_iso):
+    return fetch_forecast(dt.date.fromisoformat(day_iso))
+
+
+TODAY = dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).date()  # 서버가 해외여도 한국 날짜 기준
+
 st.sidebar.header("① 날짜")
-day = st.sidebar.date_input("예측할 날짜", dt.date.today() + dt.timedelta(days=1))
+day = st.sidebar.date_input("예측할 날짜", TODAY + dt.timedelta(days=1))
 offday = st.sidebar.checkbox("휴일 (주말·공휴일)", value=day.weekday() >= 5,
                              help="주말은 자동으로 체크됩니다. 공휴일이면 직접 체크하세요.")
 
 st.sidebar.header("② 기상 예보")
-mode = st.sidebar.radio("입력 방식", ["최저·최고기온으로 간단 입력", "CSV 업로드 (24시간)"])
+MODES = ["예보 자동 불러오기 (Open-Meteo)", "최저·최고기온으로 간단 입력", "CSV 업로드 (24시간)"]
+mode = st.sidebar.radio("입력 방식", MODES)
 typ = B["month_typical"].loc[day.month]
+src = ""
 
-if mode.startswith("최저"):
+
+def typical_weather():
+    T0, H0 = make_hourly_weather(B, day.month, typ["tmin"], typ["tmax"], typ["hmean"])
+    return pd.DataFrame({"시": HOURS, "기온": T0, "습도": H0})
+
+
+if mode == MODES[0]:
+    lo, hi = TODAY - dt.timedelta(days=MAX_PAST_DAYS), TODAY + dt.timedelta(days=MAX_AHEAD_DAYS)
+    if not (lo <= day <= hi):
+        st.sidebar.warning(f"자동 예보는 {lo:%m/%d} ~ {hi:%m/%d} 날짜만 불러올 수 있어요. "
+                           f"이 날짜는 2025년 {day.month}월 평균 날씨로 예측합니다.")
+        wx, src = typical_weather(), f"2025년 {day.month}월 평균 날씨 (예보 범위 밖)"
+    else:
+        try:
+            wx, per_station = get_forecast(day.isoformat())
+            src = "Open-Meteo 예보 (4개 관측소 위치 평균, CC BY 4.0)"
+            st.sidebar.success("예보를 불러왔어요. 날짜만 바꾸면 자동으로 다시 불러옵니다.")
+            c1, c2 = st.sidebar.columns(2)
+            c1.metric("최저기온", f"{wx['기온'].min():.1f}℃")
+            c2.metric("최고기온", f"{wx['기온'].max():.1f}℃")
+            st.sidebar.metric("평균습도", f"{wx['습도'].mean():.0f}%")
+            with st.sidebar.expander("시간별 예보 보기"):
+                st.dataframe(wx, hide_index=True, height=300)
+                st.caption("관측소별 기온")
+                st.dataframe(per_station, hide_index=True, height=200)
+            if st.sidebar.button("예보 새로고침"):
+                get_forecast.clear()
+                st.rerun()
+        except Exception:
+            st.sidebar.error("예보를 불러오지 못했어요(인터넷 연결 확인). "
+                             f"2025년 {day.month}월 평균 날씨로 대신 예측합니다.")
+            wx, src = typical_weather(), f"2025년 {day.month}월 평균 날씨 (예보 불러오기 실패)"
+elif mode == MODES[1]:
     c1, c2 = st.sidebar.columns(2)
     tmin = c1.number_input("최저기온(℃)", -10.0, 40.0, float(typ["tmin"]), 0.5)
     tmax = c2.number_input("최고기온(℃)", -10.0, 45.0, float(typ["tmax"]), 0.5)
@@ -51,6 +100,7 @@ if mode.startswith("최저"):
     wx = pd.DataFrame({"시": HOURS, "기온": T0, "습도": H0})
     wx = st.sidebar.data_editor(wx, key=f"ed_{day.month}_{tmin}_{tmax}_{hmean}", hide_index=True,
                                 disabled=["시"], height=300)
+    src = "직접 입력"
 else:
     tmpl = pd.DataFrame({"시": HOURS, "기온": "", "습도": ""}).to_csv(index=False).encode("utf-8-sig")
     st.sidebar.download_button("입력 양식 내려받기", tmpl, "forecast_template.csv", "text/csv")
@@ -67,6 +117,7 @@ else:
         st.error("CSV에는 '시', '기온', '습도' 열과 24개 행(1~24시)이 있어야 합니다.")
         st.stop()
     wx = wx.sort_values("시")[["시", "기온", "습도"]]
+    src = "CSV 업로드"
 
 wx = wx.astype(float)
 if wx.isna().any().any():
@@ -94,6 +145,8 @@ def level(v):
 st.title("⚡ 제주 전력수요 예보기")
 st.caption(f"기온·습도 예보로 제주 시간별 전력수요를 예측합니다 · 학습자료: 2025년 제주 시간별 전력수요, "
            f"ASOS 4개 관측소(제주·고산·서귀포·성산) 평균")
+
+st.markdown(f"**{day.year}년 {day.month}월 {day.day}일** 예측 · 기상 자료: {src}")
 
 tab1, tab2, tab3 = st.tabs(["📈 예측", "🌡️ 시나리오", "📚 모형 설명"])
 
